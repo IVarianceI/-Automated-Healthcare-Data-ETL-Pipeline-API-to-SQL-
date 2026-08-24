@@ -1,0 +1,23 @@
+name: Python CI (自動化質檢)
+
+# 當有人 push 程式碼到 main 分支時，觸發這個機器人
+on:
+  push:
+    branches: [ "main" ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest # 機器人借用一台雲端 Linux 電腦
+
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: 準備 Python 環境
+      uses: actions/setup-python@v3
+      with:
+        python-version: "3.10"
+        
+    - name: 執行簡單測試
+      run: |
+        echo "🚀 CI 機器人啟動！正在檢查你的 Python 程式碼..."
+        python -c "print('測試通過！這就是 CI/CD 的第一步！')"
