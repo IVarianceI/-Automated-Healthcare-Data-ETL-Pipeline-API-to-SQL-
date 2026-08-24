@@ -1,116 +1,184 @@
-import pandas as pd
-import base64
-import requests
 import os
-import time
-import random
+import requests
+import pandas as pd
+import xml.etree.ElementTree as ET
+import numpy as np
+import re
+import math
 from dotenv import load_dotenv
 
 # ==========================================
-# 0. 架构初始化：安全解耦与环境变量加载
+# 1. Initialization & API Configuration
 # ==========================================
-print("🔧 正在初始化工业级 ETL 自动化管线...")
-load_dotenv() # 自动读取本地 .env 文件
+print("🔧 Initializing End-to-End EHR Data Pipeline...")
+load_dotenv(override=True)
 
-# 从系统环境变量提取机密凭证，彻底杜绝硬编码 (Hardcoding)
-ENCRYPTED_CONN = os.getenv("CREDIBLE_API_KEY")
-IMPORT_URL = os.getenv("CREDIBLE_IMPORT_URL")
+# Fetch sensitive credentials from environment variables (.env)
+ENCRYPTED_CONN = os.getenv("EXPORT_API_TOKEN")
+# MOCKED FOR PUBLIC REPO: Use actual Report ID in production
+EXPORT_ID = os.getenv("REPORT_EXPORT_ID", "9999") 
 
-if not ENCRYPTED_CONN or not IMPORT_URL:
-    raise ValueError("🚨 致命错误：环境变量未加载！请检查 .env 文件是否存在并配置正确。")
+if not ENCRYPTED_CONN:
+    raise ValueError("❌ Missing API_TOKEN in environment variables. Please set it in your .env file.")
 
-print("🔥 终极荣耀：高吞吐量 CSV 直连引擎启动 (挂载指数退避护盾)...\n")
+URL = "https://reportservices.crediblebh.com/reports/ExportService.asmx"
 
-# ==========================================
-# 1. 数据抽取 (Extract)：模拟上游数据源
-# ==========================================
-# 真实生产环境中，这里可能是通过 SQLAlchemy 从 SQL Server 提取的数万条历史记录
-mock_client_data = [
-    {"Internal_ID": f"{100000 + i}", "Target_DOB": "12/20/2010"} 
-    for i in range(1250)
-]
-df_total = pd.DataFrame(mock_client_data)
-total_rows = len(df_total)
+# Dates are handled dynamically in SQL. We only need the random seed.
+dynamic_seed = "2500"
+
+print("📅 Data extraction period: Automatically calculated by SQL (Previous Quarter)")
+print(f"🔢 Random seed parameter initialized: {dynamic_seed}")
 
 # ==========================================
-# 2. 核心工程参数配置
+# 2. SOAP Payload Construction
 # ==========================================
-CHUNK_SIZE = 500       # 内存切片大小：单批次最大吞吐量
-MAX_RETRIES = 3        # 韧性机制：最大允许网络重试次数
-BASE_DELAY = 2.0       # 韧性机制：基础退避时间 (秒)
-
-print(f"📊 任务清点：捕获总计 {total_rows} 条记录。")
-print(f"⚙️  管线配置：单批吞吐 {CHUNK_SIZE} 条 | 最大重试 {MAX_RETRIES} 次。\n")
-
-# ==========================================
-# 3. 数据转换与加载引擎 (Transform & Load)
-# ==========================================
-batch_count = 0
-
-for i in range(0, total_rows, CHUNK_SIZE):
-    batch_count += 1
-    
-    # [3.1 数据切片]
-    df_chunk = df_total.iloc[i : i + CHUNK_SIZE]
-    current_chunk_size = len(df_chunk)
-    
-    print(f"📦 [Batch {batch_count}] 开始处理数据区间: 行 {i} 至 {i + current_chunk_size}...")
-
-    # [3.2 内存级清洗与序列化]
-    # header=False 极其重要，确保只传输纯数据，避免下游 EHR 系统解析表头崩溃
-    csv_raw_string = df_chunk.to_csv(index=False, header=False, lineterminator='\r\n')
-    encoded_file_string = base64.b64encode(csv_raw_string.encode('utf-8')).decode('utf-8')
-
-    # [3.3 动态构建 SOAP Payload]
-    xml_payload = f"""<?xml version="1.0" encoding="utf-8"?>
+xml_payload = f"""<?xml version="1.0" encoding="utf-8"?>
 <soap:Envelope xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
   <soap:Body>
-    <Import xmlns="https://www.crediblebh.com/">
+    <ExportDataSet xmlns="https://www.crediblebh.com/">
       <connection>{ENCRYPTED_CONN}</connection>
-      <encodedfile>{encoded_file_string}</encodedfile>
-    </Import>
+      <export_id>{EXPORT_ID}</export_id>
+      <param3>{dynamic_seed}</param3>
+    </ExportDataSet>
   </soap:Body>
 </soap:Envelope>"""
 
-    HEADERS = {
-        "Content-Type": "text/xml; charset=utf-8",
-        "SOAPAction": '"https://www.crediblebh.com/Import"' 
-    }
+HEADERS = {
+    "Content-Type": "text/xml; charset=utf-8",
+    "SOAPAction": '"https://www.crediblebh.com/ExportDataSet"' 
+}
 
-    # [3.4 挂载指数退避重试护盾发射]
-    for attempt in range(MAX_RETRIES):
-        try:
-            # 保护性限频：正常请求间的微小延迟，防止触发 API 速率限制
-            if batch_count > 1 and attempt == 0:
-                time.sleep(0.5) 
-                
-            # timeout=15 防止服务器僵死导致脚本永久挂起
-            response = requests.post(IMPORT_URL, data=xml_payload, headers=HEADERS, timeout=15)
-            result_text = response.text
+# ==========================================
+# 3. API Execution & Data Parsing
+# ==========================================
+print("🎯 Fetching data from EHR SOAP API...")
+
+try:
+    response = requests.post(URL, data=xml_payload, headers=HEADERS, timeout=60)
+    
+    if response.status_code == 200 and "<ErrorDataSet>" not in response.text:
+        # Parse XML directly into memory
+        root = ET.fromstring(response.text)
+        data_rows = []
+        
+        for elem in root.iter():
+            tag_name = elem.tag.split('}')[-1] 
+            if tag_name == 'Table' and not any('complexType' in child.tag for child in elem):
+                row_dict = {child.tag.split('}')[-1]: child.text for child in elem}
+                if row_dict:
+                    data_rows.append(row_dict)
+        
+        if data_rows:
+            # Create the initial DataFrame directly from the API response
+            df_exported = pd.DataFrame(data_rows)
+            print(f"✅ API extraction successful. {len(df_exported)} records loaded into memory.")
             
-            # [3.5 战报解析与深层异常拦截]
-            if "<ImportResult>" in result_text:
-                start_idx = result_text.find("<ImportResult>") + len("<ImportResult>")
-                end_idx = result_text.find("</ImportResult>")
-                core_message = result_text[start_idx:end_idx]
-                
-                print(f"  ✅ 吞吐成功！响应条数: {current_chunk_size} 条 | 战报: {core_message.strip()}")
-                break # 💥 成功突围，跳出重试循环，直接进入下一个 Batch
-            else:
-                # 触发业务级异常，被下方的 except 捕获并进入重试逻辑
-                raise ValueError(f"API 返回异常报文或假 200: {result_text[:100]}")
+            # ==========================================
+            # 4. Data Cleaning & Type Conversion
+            # ==========================================
+            print("⚙️ Processing data and applying business logic...")
+            
+            # Convert XML string values to numeric for math and sorting
+            df_exported['billable_count'] = pd.to_numeric(df_exported['billable_count'], errors='coerce').fillna(0)
+            df_exported['random'] = pd.to_numeric(df_exported['random'], errors='coerce')
+            
+            # Exclude test patients and 0 billable counts
+            df_exported = df_exported[df_exported['billable_count'] != 0]
+            df_exported = df_exported[df_exported['last_name'] != 'Test']
+            df_exported['episode_status'] = df_exported['episode_status'].astype(str).str.title()
 
-        except Exception as e:
-            if attempt < MAX_RETRIES - 1:
-                # 核心算法：指数退避 + 随机抖动 (Jitter)
-                wait_time = BASE_DELAY * (2 ** attempt) + random.uniform(0, 1)
-                
-                print(f"  ⚠️ 遭遇网络乱流 (Attempt {attempt+1}/{MAX_RETRIES}): {e}")
-                print(f"  ⏳ 启动指数退避，静默等待 {wait_time:.2f} 秒后发起重组冲击...")
-                time.sleep(wait_time)
-            else:
-                # 重试耗尽，记录错误但不中断整个循环，确保不影响后续健康批次的发送
-                print(f"  ❌ 终极崩溃！重试 {MAX_RETRIES} 次均告失败，该批次流产。死因: {e}")
-                # 生产环境扩展点：可在此处将失败的 df_chunk 写入 error_log.csv 以备人工修复
+            # ==========================================
+            # 5. Business Logic Functions
+            # ==========================================
+            def group_programs(prog_name):
+                prog_name = str(prog_name)
+                # MOCKED FOR PUBLIC REPO: Generalized business categories
+                if prog_name.startswith('PROG_A'):
+                    return 'Category_A_Group'
+                elif 'North' in prog_name:
+                    return 'North_Region_Group'
+                return prog_name
 
-print(f"\n🏁 战役结束！全案 {total_rows} 条数据已分 {batch_count} 个批次全自动化处理完毕。")
+            def map_status(status):
+                s_lower = str(status).strip().lower()
+                if s_lower in ['active', 'pending']:
+                    return 'Active'
+                elif s_lower in ['pending disch', 'inactive', 'closed']:
+                    return 'Inactive'
+                return 'Inactive'
+
+            # Apply grouping and mapping logic
+            df_exported['program_group'] = df_exported['program'].apply(group_programs)
+            df_exported['mapped_status'] = df_exported['episode_status'].apply(map_status)
+
+            # ==========================================
+            # 6. Excel Generation & Dynamic Formatting
+            # ==========================================
+            # Use a relative path so the script runs on any machine
+            output_dir = os.path.join(os.getcwd(), 'output')
+            os.makedirs(output_dir, exist_ok=True)
+            output_file = os.path.join(output_dir, 'QRR_Analysis_Results.xlsx')
+            
+            print(f"📝 Generating Excel report with dynamic sampling...")
+            
+            with pd.ExcelWriter(output_file, engine='xlsxwriter') as writer:
+                workbook = writer.book
+                groups = df_exported['program_group'].unique()
+                statuses = df_exported['mapped_status'].unique()
+                used_tabs = set()
+                
+                # Highlight format: Yellow background
+                highlight_format = workbook.add_format({'bg_color': '#FFFF00'})
+
+                for group in groups:
+                    for status in statuses:
+                        subset = df_exported[(df_exported['program_group'] == group) & (df_exported['mapped_status'] == status)].copy()
+                        
+                        if not subset.empty:
+                            # A. Calculate sample size X
+                            row_count = len(subset)
+                            if row_count < 50:
+                                sample_size = min(5, row_count)
+                            else:
+                                sample_size = math.ceil(row_count / 10)
+                            
+                            # B. Sort by 'random'
+                            subset = subset.sort_values(by='random', ascending=True).reset_index(drop=True)
+                            
+                            # C. Drop helper columns to keep the export clean
+                            cols_to_drop = ['program_group', 'mapped_status']
+                            subset = subset.drop(columns=[c for c in cols_to_drop if c in subset.columns])
+                            
+                            # D. Naming process (handle invalid characters and max length 31)
+                            base_name = re.sub(r'[\[\]:*?/\\/]', '_', f"{group}_{status}")
+                            tab_name = base_name[:31]
+                            
+                            counter = 1
+                            while tab_name.lower() in used_tabs:
+                                suffix = f"_{counter}"
+                                tab_name = f"{base_name[:31-len(suffix)]}{suffix}"
+                                counter += 1
+                            used_tabs.add(tab_name.lower())
+                            
+                            # E. Write subset to Excel (exclude index)
+                            subset.to_excel(writer, sheet_name=tab_name, index=False)
+                            
+                            # F. Apply conditional formatting (highlight top X rows)
+                            worksheet = writer.sheets[tab_name]
+                            worksheet.conditional_format(1, 0, sample_size, subset.shape[1]-1, 
+                                                        {'type': 'no_blanks', 
+                                                         'format': highlight_format})
+                            
+                            print(f"  -> Sheet '{tab_name}': {row_count} rows in total, highlighted top {sample_size}.")
+
+            print(f"\n🚀 Pipeline complete! Final report successfully saved to: {output_file}")
+            
+        else:
+            print("⚠️ API request succeeded, but no records were found (business vacuum).")
+    else:
+        print(f"❌ API Request failed. Status code: {response.status_code}")
+        if "<ErrorDataSet>" in response.text:
+             print("Server returned an internal error dataset. Please check the SQL tool.")
+
+except Exception as e:
+    print(f"🚨 Pipeline crashed with an unexpected error: {e}")
